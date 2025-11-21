@@ -1,0 +1,6 @@
+CLIP Model: openai/clip-vit-base-patch32
+ONNX Opset Version: 18
+Vision Model: clip_vision.onnx
+Text Model: clip_text.onnx
+Vision Output Dimension: 768
+Text Output Dimension: 512
