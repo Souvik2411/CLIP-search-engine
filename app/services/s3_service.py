@@ -183,28 +183,49 @@ class S3Service:
         max_keys: int = 1000
     ) -> list[str]:
         """
-        List image keys in S3 bucket.
+        List image keys in S3 bucket with pagination support.
 
         Args:
             prefix: S3 key prefix to filter
-            max_keys: Maximum number of keys to return
+            max_keys: Maximum number of keys to return (None for all)
 
         Returns:
             List of S3 keys
         """
         try:
-            response = self.client.list_objects_v2(
-                Bucket=self.settings.S3_BUCKET_NAME,
-                Prefix=prefix,
-                MaxKeys=max_keys
-            )
-
             keys = []
-            for obj in response.get('Contents', []):
-                key = obj['Key']
-                # Filter for common image extensions
-                if key.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
-                    keys.append(key)
+            continuation_token = None
+
+            # Paginate through all results if max_keys is None or > 1000
+            while True:
+                # Build request parameters
+                params = {
+                    'Bucket': self.settings.S3_BUCKET_NAME,
+                    'Prefix': prefix,
+                    'MaxKeys': min(1000, max_keys) if max_keys else 1000
+                }
+
+                if continuation_token:
+                    params['ContinuationToken'] = continuation_token
+
+                response = self.client.list_objects_v2(**params)
+
+                # Collect image keys
+                for obj in response.get('Contents', []):
+                    key = obj['Key']
+                    # Filter for common image extensions
+                    if key.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+                        keys.append(key)
+
+                        # Stop if we've reached max_keys
+                        if max_keys and len(keys) >= max_keys:
+                            return keys
+
+                # Check if there are more results
+                if response.get('IsTruncated'):
+                    continuation_token = response.get('NextContinuationToken')
+                else:
+                    break
 
             return keys
         except ClientError as e:
@@ -229,3 +250,7 @@ class S3Service:
             return True
         except ClientError:
             return False
+
+
+# Create singleton instance
+s3_service = S3Service()
