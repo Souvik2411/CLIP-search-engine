@@ -18,6 +18,9 @@ from app.models.schemas import (
 from app.services import CLIPService, CLIPONNXService, FAISSService, S3Service, LLMService
 from app.services.search_history_service import SearchHistoryService
 from app.services.favorites_service import FavoritesService
+from app.services.indexing_service import IndexingService
+from app.services.enhanced_search_service import EnhancedSearchService
+from app.services.metadata_db_service import metadata_db_service
 from app.utils.helpers import load_image_from_bytes, fuse_embeddings
 from app.config import get_settings
 
@@ -43,6 +46,10 @@ s3_service = S3Service()
 llm_service = LLMService()
 history_service = SearchHistoryService()
 favorites_service = FavoritesService()
+
+# Initialize enhanced services
+indexing_service = IndexingService(clip_service, faiss_service)
+enhanced_search_service = EnhancedSearchService(clip_service, faiss_service)
 
 
 # Startup will be handled by lifespan in main.py (deprecated @router.on_event)
@@ -173,16 +180,45 @@ async def search(
             )
 
         # Get presigned URLs for results (async for better performance)
-        s3_keys = [meta['s3_key'] for meta, _ in search_results]
-        urls = await s3_service.get_presigned_urls_async(s3_keys)
+        # Handle both old format (s3_url) and new format (s3_key)
+        s3_keys = []
+        for meta, _ in search_results:
+            if 's3_key' in meta:
+                s3_key = meta['s3_key']
+                # Skip local images
+                if not s3_key.startswith('local/'):
+                    s3_keys.append(s3_key)
+            elif 's3_url' in meta:
+                # Extract s3_key from presigned URL (backward compatibility)
+                s3_url = meta['s3_url']
+                if 's3.amazonaws.com/' in s3_url:
+                    # Parse: https://bucket.s3.amazonaws.com/key?params -> key
+                    s3_key = s3_url.split('s3.amazonaws.com/')[-1].split('?')[0]
+                    s3_keys.append(s3_key)
+
+        urls = await s3_service.get_presigned_urls_async(s3_keys) if s3_keys else {}
 
         # Build result objects
         results = []
         for meta, score in search_results:
+            # Get s3_key from metadata (handle both formats)
+            s3_key = meta.get('s3_key')
+            if not s3_key and 's3_url' in meta:
+                s3_url = meta['s3_url']
+                if 's3.amazonaws.com/' in s3_url:
+                    s3_key = s3_url.split('s3.amazonaws.com/')[-1].split('?')[0]
+                else:
+                    s3_key = s3_url  # Fallback
+
+            # Get URL (either from generated presigned URLs or use stored s3_url)
+            url = urls.get(s3_key, '') if s3_key else ''
+            if not url and 's3_url' in meta:
+                url = meta['s3_url']  # Use stored URL as fallback
+
             results.append(ImageMetadata(
                 image_id=meta['image_id'],
-                s3_key=meta['s3_key'],
-                url=urls.get(meta['s3_key'], ''),
+                s3_key=s3_key or '',
+                url=url,
                 score=score,
                 labels=meta.get('labels')
             ))
@@ -249,16 +285,45 @@ async def search_similar_by_id(
             )
 
         # Get presigned URLs for results (async for better performance)
-        s3_keys = [meta['s3_key'] for meta, _ in search_results]
-        urls = await s3_service.get_presigned_urls_async(s3_keys)
+        # Handle both old format (s3_url) and new format (s3_key)
+        s3_keys = []
+        for meta, _ in search_results:
+            if 's3_key' in meta:
+                s3_key = meta['s3_key']
+                # Skip local images
+                if not s3_key.startswith('local/'):
+                    s3_keys.append(s3_key)
+            elif 's3_url' in meta:
+                # Extract s3_key from presigned URL (backward compatibility)
+                s3_url = meta['s3_url']
+                if 's3.amazonaws.com/' in s3_url:
+                    # Parse: https://bucket.s3.amazonaws.com/key?params -> key
+                    s3_key = s3_url.split('s3.amazonaws.com/')[-1].split('?')[0]
+                    s3_keys.append(s3_key)
+
+        urls = await s3_service.get_presigned_urls_async(s3_keys) if s3_keys else {}
 
         # Build result objects
         results = []
         for meta, score in search_results:
+            # Get s3_key from metadata (handle both formats)
+            s3_key = meta.get('s3_key')
+            if not s3_key and 's3_url' in meta:
+                s3_url = meta['s3_url']
+                if 's3.amazonaws.com/' in s3_url:
+                    s3_key = s3_url.split('s3.amazonaws.com/')[-1].split('?')[0]
+                else:
+                    s3_key = s3_url  # Fallback
+
+            # Get URL (either from generated presigned URLs or use stored s3_url)
+            url = urls.get(s3_key, '') if s3_key else ''
+            if not url and 's3_url' in meta:
+                url = meta['s3_url']  # Use stored URL as fallback
+
             results.append(ImageMetadata(
                 image_id=meta['image_id'],
-                s3_key=meta['s3_key'],
-                url=urls.get(meta['s3_key'], ''),
+                s3_key=s3_key or '',
+                url=url,
                 score=score,
                 labels=meta.get('labels')
             ))
@@ -569,4 +634,289 @@ async def clear_favorites():
     return {
         "message": f"Cleared {count} favorites",
         "cleared_count": count
+    }
+
+
+# ===== ENHANCED INDEXING ENDPOINTS =====
+
+@router.post("/index/enhanced")
+@limiter.limit("10/hour")
+async def index_image_enhanced(
+    request: Request,
+    image: UploadFile = File(...),
+    s3_key: Optional[str] = Form(None),
+    generate_summary: bool = Form(True)
+):
+    """
+    Enhanced indexing endpoint that extracts comprehensive features.
+
+    This extracts:
+    - CLIP embeddings and labels
+    - Color palette and statistics
+    - Texture features (GLCM, LBP)
+    - Material detection
+    - Style classification
+    - Scene detection
+    - LLM summary
+
+    Processing time: 3-10 seconds per image (offline, acceptable)
+    Rate limit: 10 requests per hour per IP
+    """
+    try:
+        # Validate file size
+        content = await image.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail="Image file too large. Maximum 10MB allowed."
+            )
+
+        # Load image
+        await image.seek(0)
+        image_bytes = await image.read()
+        pil_image = load_image_from_bytes(image_bytes)
+
+        # Process image through enhanced pipeline
+        metadata = indexing_service.process_image(
+            image=pil_image,
+            s3_key=s3_key,
+            generate_summary=generate_summary
+        )
+
+        return {
+            "success": True,
+            "image_id": metadata["image_id"],
+            "processing_time": metadata["processing_time"],
+            "metadata": {
+                "primary_label": metadata["primary_label"],
+                "primary_style": metadata["style"]["primary_style"],
+                "primary_scene": metadata["style"]["primary_scene"],
+                "dominant_color": metadata["color"]["dominant_color"],
+                "primary_material": metadata["materials"]["primary_category"],
+                "summary": metadata.get("summary"),
+            },
+            "timing_breakdown": metadata["timing"]
+        }
+
+    except Exception as e:
+        logger.error(f"Enhanced indexing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/index/enhanced/batch")
+async def index_batch_enhanced(request: dict):
+    """
+    Batch index images from S3 with enhanced features.
+
+    Request body:
+        - s3_keys: List of S3 keys to index
+        - generate_summaries: Whether to generate LLM summaries (default: True)
+    """
+    s3_keys = request.get("s3_keys", [])
+    generate_summaries = request.get("generate_summaries", True)
+
+    if not s3_keys:
+        raise HTTPException(status_code=400, detail="No s3_keys provided")
+
+    if len(s3_keys) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 images per batch")
+
+    try:
+        # Download and process images
+        images = []
+        for s3_key in s3_keys:
+            try:
+                pil_image = s3_service.download_image(s3_key)
+                images.append((pil_image, s3_key))
+            except Exception as e:
+                logger.error(f"Error downloading {s3_key}: {e}")
+                continue
+
+        # Process batch
+        results = indexing_service.process_batch(
+            images=images,
+            generate_summaries=generate_summaries
+        )
+
+        return {
+            "success": True,
+            "processed_count": len(results),
+            "failed_count": len(s3_keys) - len(results),
+            "results": [
+                {
+                    "image_id": r["image_id"],
+                    "processing_time": r["processing_time"]
+                }
+                for r in results
+            ]
+        }
+
+    except Exception as e:
+        logger.error(f"Batch indexing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===== ENHANCED SEARCH ENDPOINTS =====
+
+@router.post("/search/enhanced")
+@limiter.limit("30/minute")
+async def search_enhanced(
+    request: Request,
+    image: Optional[UploadFile] = File(None),
+    text_query: Optional[str] = Form(None),
+    use_filters: bool = Form(True),
+    top_k: int = Form(10)
+):
+    """
+    Enhanced search with hybrid vector + metadata filtering.
+
+    Features:
+    - Automatic filter extraction from text queries
+      (e.g., "warm modern living room" → filters: warm color, modern style, living room scene)
+    - Fast metadata pre-filtering in SQLite
+    - FAISS vector search on filtered candidates only
+    - Enriched results with full metadata
+
+    Response time: ~100-200ms (much faster than full FAISS scan)
+    Rate limit: 30 requests per minute per IP
+    """
+    if image is None and text_query is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Must provide either image, text_query, or both"
+        )
+
+    try:
+        # Case 1: Text only
+        if image is None and text_query is not None:
+            results = enhanced_search_service.search_with_text(
+                query=text_query,
+                top_k=top_k,
+                use_filters=use_filters
+            )
+
+        # Case 2: Image only
+        elif image is not None and text_query is None:
+            image_bytes = await image.read()
+            pil_image = load_image_from_bytes(image_bytes)
+
+            results = enhanced_search_service.search_with_image(
+                image=pil_image,
+                top_k=top_k,
+                filters=None
+            )
+
+        # Case 3: Image + Text
+        else:
+            image_bytes = await image.read()
+            pil_image = load_image_from_bytes(image_bytes)
+
+            results = enhanced_search_service.search_with_image_and_text(
+                image=pil_image,
+                text=text_query,
+                top_k=top_k,
+                use_filters=use_filters
+            )
+
+        return {
+            "success": True,
+            "results": results,
+            "total_results": len(results)
+        }
+
+    except Exception as e:
+        logger.error(f"Enhanced search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===== METADATA ENDPOINTS =====
+
+@router.get("/metadata/{image_id}")
+async def get_image_metadata_endpoint(image_id: str):
+    """
+    Get comprehensive metadata for an image.
+
+    Returns all extracted features:
+    - CLIP labels
+    - Color palette and statistics
+    - Texture features
+    - Materials
+    - Style and scene
+    - Summary
+    """
+    metadata = metadata_db_service.get_image_metadata(image_id)
+
+    if not metadata:
+        raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+
+    return {"image_id": image_id, "metadata": metadata}
+
+
+@router.get("/metadata/stats")
+async def get_metadata_stats():
+    """
+    Get database statistics.
+
+    Returns:
+    - Total images indexed
+    - Top styles distribution
+    - Top scenes distribution
+    """
+    stats = metadata_db_service.get_stats()
+    return stats
+
+
+@router.get("/metadata/search/filters")
+async def search_by_filters_endpoint(
+    color_temp: Optional[str] = None,
+    brightness: Optional[str] = None,
+    material_category: Optional[str] = None,
+    texture_roughness: Optional[str] = None,
+    style: Optional[str] = None,
+    scene: Optional[str] = None,
+    limit: int = 50
+):
+    """
+    Search images by metadata filters only (no vector search).
+
+    Useful for exploring the dataset by specific attributes.
+
+    Query parameters:
+    - color_temp: warm, cool, neutral
+    - brightness: bright, medium, dark
+    - material_category: wood, metal, fabric, leather, stone, glass, ceramic, plastic
+    - texture_roughness: smooth, moderate, rough
+    - style: modern, contemporary, minimalist, industrial, rustic, vintage, etc.
+    - scene: living room, bedroom, kitchen, bathroom, etc.
+    - limit: max results (default 50, max 200)
+    """
+    limit = min(limit, 200)
+
+    image_ids = metadata_db_service.search_by_filters(
+        color_temp=color_temp,
+        brightness=brightness,
+        material_category=material_category,
+        texture_roughness=texture_roughness,
+        style=style,
+        scene=scene,
+        limit=limit
+    )
+
+    # Get full metadata for each image
+    results = []
+    for image_id in image_ids:
+        meta = metadata_db_service.get_image_metadata(image_id)
+        if meta:
+            results.append({
+                "image_id": image_id,
+                "s3_url": meta.get("s3_url"),
+                "primary_style": meta.get("primary_style"),
+                "primary_scene": meta.get("primary_scene"),
+                "dominant_color": meta.get("dominant_color"),
+                "primary_material": meta.get("primary_material_category"),
+            })
+
+    return {
+        "results": results,
+        "total_results": len(results)
     }
