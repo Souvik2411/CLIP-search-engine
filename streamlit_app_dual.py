@@ -579,30 +579,25 @@ def main():
         st.markdown("### 📊 Navigation")
         st.markdown("Access your data on dedicated pages for better performance:")
 
-        # Quick counts (cached - only fetch once per session or after history/favorite operations)
+        # Initialize with default values (lazy loading - fetch after main UI renders)
         if 'sidebar_history_count' not in st.session_state:
-            try:
-                history_data = get_search_history(limit=1)
-                st.session_state.sidebar_history_count = history_data.get("total_count", 0) if history_data else 0
-            except:
-                st.session_state.sidebar_history_count = 0
-
-        history_count = st.session_state.sidebar_history_count
+            st.session_state.sidebar_history_count = None  # Will be fetched after main UI loads
 
         if 'sidebar_favorites_count' not in st.session_state:
-            try:
-                favorites_data = get_favorites()
-                st.session_state.sidebar_favorites_count = favorites_data.get("total_count", 0) if favorites_data else 0
-            except:
-                st.session_state.sidebar_favorites_count = 0
+            st.session_state.sidebar_favorites_count = None  # Will be fetched after main UI loads
 
+        # Display counts (use loading state if not yet fetched)
+        history_count = st.session_state.sidebar_history_count
         favorites_count = st.session_state.sidebar_favorites_count
+
+        history_display = f"**{history_count}**" if history_count is not None else "**...**"
+        favorites_display = f"**{favorites_count}**" if favorites_count is not None else "**...**"
 
         # Navigation info with counts
         st.info(f"""
         📊 **Quick Access:**
-        - 🕒 Search History: **{history_count}** sessions
-        - ❤️ Favorites: **{favorites_count}** saved images
+        - 🕒 Search History: {history_display} sessions
+        - ❤️ Favorites: {favorites_display} saved images
 
         👉 Use the sidebar menu above to navigate to these pages
         """)
@@ -614,14 +609,33 @@ def main():
         # About Section
         with st.expander("ℹ️ About", expanded=False):
             st.markdown("""
-            **ARCHINZA Search Pipeline**
+            **ARCHINZA Search Pipeline v1.3.0**
 
-            AI-powered architectural image search using:
-            - 🤖 CLIP for visual understanding
-            - 🔍 FAISS for fast similarity search
-            - 💬 GPT-4o-mini for smart summaries
+            *AI-Powered Architectural Image Search with Multi-Modal Analysis*
 
-            Optimized for 5K+ images and 500+ searches/day
+            ---
+
+            **Performance:**
+            - 🔄 Optimized for 5K+ images & 500+ queries/day
+
+            ---
+
+            **🔍 Search Capabilities:**
+            - **Image-Only Search**: Upload architectural images to find similar designs
+            - **Text-Only Search**: Describe your vision in natural language
+            - **Hybrid Search**: Combine image + text for precise results
+            - **Conversational Refinement**: Chat to adjust results iteratively
+            - **"More Like This"**: Fast image-id based similarity (no re-processing)
+            - **Context-Aware Suggestions**: Dynamic refinement prompts based on results
+
+            ---
+
+            **🔧 Technical Details:**
+            - Backend: FastAPI + Uvicorn
+            - Frontend: Streamlit (Dual-panel layout)
+            - Storage: AWS S3 + SQLite + FAISS
+            - Processing: Offline indexing (3-10s/image)
+            - Deployment: t3.large EC2 (8GB RAM)
             """)
 
     # DUAL PANEL LAYOUT
@@ -900,6 +914,24 @@ def main():
                         "timestamp": datetime.now().isoformat()
                     })
                     st.rerun()
+
+    # Lazy load sidebar counts after main UI is rendered (non-blocking)
+    # This ensures the search bar appears immediately without waiting for API calls
+    if st.session_state.sidebar_history_count is None:
+        try:
+            history_data = get_search_history(limit=1)
+            st.session_state.sidebar_history_count = history_data.get("total_count", 0) if history_data else 0
+        except:
+            st.session_state.sidebar_history_count = 0
+        st.rerun()  # Refresh to update sidebar with loaded counts
+
+    if st.session_state.sidebar_favorites_count is None:
+        try:
+            favorites_data = get_favorites()
+            st.session_state.sidebar_favorites_count = favorites_data.get("total_count", 0) if favorites_data else 0
+        except:
+            st.session_state.sidebar_favorites_count = 0
+        st.rerun()  # Refresh to update sidebar with loaded counts
 
 
 if __name__ == "__main__":
