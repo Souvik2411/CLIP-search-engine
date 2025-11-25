@@ -5,6 +5,7 @@ import logging
 from app.config import get_settings
 from app.models.schemas import UserType
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -231,3 +232,54 @@ SUGGESTIONS:
         except Exception as e:
             logger.error(f"Error generating custom response: {e}")
             raise
+
+    def generate_summary(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None
+    ) -> str:
+        """
+        Generate a synchronous summary for indexing pipeline.
+        Uses the synchronous OpenAI client for non-async contexts.
+
+        Args:
+            prompt: The prompt for summary generation
+            max_tokens: Maximum tokens for response
+
+        Returns:
+            Generated summary text
+        """
+        from openai import OpenAI
+
+        if max_tokens is None:
+            max_tokens = self.settings.LLM_MAX_TOKENS
+
+        try:
+            # Use synchronous client for offline indexing
+            sync_client = OpenAI(api_key=self.settings.OPENAI_API_KEY)
+
+            response = sync_client.chat.completions.create(
+                model=self.settings.LLM_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a helpful architecture and design assistant. Provide concise, natural descriptions."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=max_tokens,
+                temperature=0.7
+            )
+
+            return response.choices[0].message.content
+
+        except Exception as e:
+            logger.error(f"Error generating summary: {e}")
+            raise
+
+
+# Create singleton instance
+llm_service = LLMService()

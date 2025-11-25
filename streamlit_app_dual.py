@@ -4,6 +4,7 @@ from PIL import Image
 import io
 import time
 from datetime import datetime
+import threading
 
 # Configuration
 API_BASE_URL = "http://localhost:8000/api/v1"
@@ -152,6 +153,23 @@ def create_search_session(query_type, text_query, image_filename, user_type, det
         return None
 
 
+def create_search_session_async(query_type, text_query, image_filename, user_type, detected_labels, detected_objects, results_count, ai_summary):
+    """Create a new search session in background thread (non-blocking)."""
+    def _create():
+        try:
+            session_id = create_search_session(
+                query_type, text_query, image_filename, user_type,
+                detected_labels, detected_objects, results_count, ai_summary
+            )
+            if session_id and 'current_session_id' in st.session_state:
+                st.session_state.current_session_id = session_id
+        except:
+            pass
+
+    thread = threading.Thread(target=_create, daemon=True)
+    thread.start()
+
+
 def add_to_search_session(session_id, user_message, ai_response, query_type, detected_labels, detected_objects, results_count):
     """Add a refinement to an existing session."""
     try:
@@ -170,6 +188,21 @@ def add_to_search_session(session_id, user_message, ai_response, query_type, det
         return response.status_code == 200
     except:
         return False
+
+
+def add_to_search_session_async(session_id, user_message, ai_response, query_type, detected_labels, detected_objects, results_count):
+    """Add a refinement to an existing session in background thread (non-blocking)."""
+    def _add():
+        try:
+            add_to_search_session(
+                session_id, user_message, ai_response, query_type,
+                detected_labels, detected_objects, results_count
+            )
+        except:
+            pass
+
+    thread = threading.Thread(target=_add, daemon=True)
+    thread.start()
 
 
 @st.cache_data(ttl=5)  # Cache for 5 seconds - shows recent updates quickly
@@ -413,10 +446,10 @@ def render_image_grid(results_list, cols_per_row=3):
     if 'favorites_cache' not in st.session_state:
         st.session_state.favorites_cache = set()
 
-    # Batch check all image IDs at once (PERFORMANCE OPTIMIZATION)
-    # This reduces 10+ API calls to just 1 call per page load
-    all_image_ids = [result["image_id"] for result in results_list]
-    favorites_status = batch_check_favorites(all_image_ids)
+    # REMOVED: Automatic batch favorites check to reduce latency
+    # Users can manually favorite/unfavorite images
+    # all_image_ids = [result["image_id"] for result in results_list]
+    # favorites_status = batch_check_favorites(all_image_ids)
 
     for i in range(0, len(results_list), cols_per_row):
         cols = st.columns(cols_per_row)
@@ -436,8 +469,8 @@ def render_image_grid(results_list, cols_per_row=3):
                         btn_col1, btn_col2 = st.columns(2)
 
                         with btn_col1:
-                            # Favorite button with session state and batch check
-                            is_fav = image_id in st.session_state.favorites_cache or favorites_status.get(image_id, False)
+                            # Favorite button with session state only (no API check for better performance)
+                            is_fav = image_id in st.session_state.favorites_cache
                             if is_fav:
                                 st.session_state.favorites_cache.add(image_id)
 
@@ -629,9 +662,9 @@ def main():
                     # Generate contextual suggestions based on detected elements
                     contextual_suggestions = generate_contextual_suggestions(results)
 
-                    # Create a new search session
+                    # Create a new search session (non-blocking - runs in background)
                     query_type = results.get("query_type", "text_only")
-                    session_id = create_search_session(
+                    create_search_session_async(
                         query_type=query_type,
                         text_query=text_query,
                         image_filename=uploaded_file.name if uploaded_file else None,
@@ -641,7 +674,6 @@ def main():
                         results_count=results.get("total_results", 0),
                         ai_summary=results["summary"]
                     )
-                    st.session_state.current_session_id = session_id
 
                     # Add AI summary as first chat message
                     st.session_state.chat_history = [{
@@ -742,9 +774,9 @@ def main():
                                         # Generate contextual suggestions based on new results
                                         contextual_suggestions = generate_contextual_suggestions(results)
 
-                                        # Add refinement to session
+                                        # Add refinement to session (non-blocking - runs in background)
                                         if st.session_state.current_session_id:
-                                            add_to_search_session(
+                                            add_to_search_session_async(
                                                 session_id=st.session_state.current_session_id,
                                                 user_message=suggestion,
                                                 ai_response=results["summary"],
@@ -808,9 +840,9 @@ def main():
                     # Generate contextual suggestions based on new results
                     contextual_suggestions = generate_contextual_suggestions(results)
 
-                    # Add refinement to session
+                    # Add refinement to session (non-blocking - runs in background)
                     if st.session_state.current_session_id:
-                        add_to_search_session(
+                        add_to_search_session_async(
                             session_id=st.session_state.current_session_id,
                             user_message=chat_input,
                             ai_response=results["summary"],
