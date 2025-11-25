@@ -47,6 +47,8 @@ env/
 
 # Data and models
 data/index/faiss.index
+data/index/metadata.json
+data/index/metadata.db
 data/history/*.json
 data/favorites/*.json
 *.pkl
