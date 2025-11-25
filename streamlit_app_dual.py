@@ -482,6 +482,9 @@ def render_image_grid(results_list, cols_per_row=3):
                                     if remove_favorite(image_id):
                                         if image_id in st.session_state.favorites_cache:
                                             st.session_state.favorites_cache.remove(image_id)
+                                        # Update sidebar count
+                                        if 'sidebar_favorites_count' in st.session_state and st.session_state.sidebar_favorites_count > 0:
+                                            st.session_state.sidebar_favorites_count -= 1
                                         st.toast("💔 Removed from favorites", icon="✅")
                                         st.rerun()
                                 else:
@@ -494,6 +497,9 @@ def render_image_grid(results_list, cols_per_row=3):
                                         objects=None
                                     ):
                                         st.session_state.favorites_cache.add(image_id)
+                                        # Update sidebar count
+                                        if 'sidebar_favorites_count' in st.session_state:
+                                            st.session_state.sidebar_favorites_count += 1
                                         st.toast("❤️ Added to favorites!", icon="✅")
                                         st.rerun()
 
@@ -527,8 +533,12 @@ def main():
     st.markdown('<h1 class="main-header">🏛️ ARCHINZA Search</h1>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">AI-Powered Architectural Image Search with Conversational Refinement</p>', unsafe_allow_html=True)
 
-    # Check API status
-    api_status = check_api_health()
+    # Check API status (cached - only check once per session)
+    if 'api_status_checked' not in st.session_state:
+        st.session_state.api_status = check_api_health()
+        st.session_state.api_status_checked = True
+
+    api_status = st.session_state.api_status
 
     # Sidebar
     with st.sidebar:
@@ -553,12 +563,15 @@ def main():
 
         st.divider()
 
-        # Stats
-        try:
-            stats = requests.get(f"{API_BASE_URL}/index/stats").json()
-            st.metric("📚 Indexed Images", stats.get("total_vectors", 0))
-        except:
-            pass
+        # Stats (cached - only fetch once per session or when explicitly refreshed)
+        if 'index_stats' not in st.session_state:
+            try:
+                stats = requests.get(f"{API_BASE_URL}/index/stats").json()
+                st.session_state.index_stats = stats
+            except:
+                st.session_state.index_stats = {"total_vectors": 0}
+
+        st.metric("📚 Indexed Images", st.session_state.index_stats.get("total_vectors", 0))
 
         st.divider()
 
@@ -566,18 +579,24 @@ def main():
         st.markdown("### 📊 Navigation")
         st.markdown("Access your data on dedicated pages for better performance:")
 
-        # Quick counts (cached, fast)
-        try:
-            history_data = get_search_history(limit=1)
-            history_count = history_data.get("total_count", 0) if history_data else 0
-        except:
-            history_count = 0
+        # Quick counts (cached - only fetch once per session or after history/favorite operations)
+        if 'sidebar_history_count' not in st.session_state:
+            try:
+                history_data = get_search_history(limit=1)
+                st.session_state.sidebar_history_count = history_data.get("total_count", 0) if history_data else 0
+            except:
+                st.session_state.sidebar_history_count = 0
 
-        try:
-            favorites_data = get_favorites()
-            favorites_count = favorites_data.get("total_count", 0) if favorites_data else 0
-        except:
-            favorites_count = 0
+        history_count = st.session_state.sidebar_history_count
+
+        if 'sidebar_favorites_count' not in st.session_state:
+            try:
+                favorites_data = get_favorites()
+                st.session_state.sidebar_favorites_count = favorites_data.get("total_count", 0) if favorites_data else 0
+            except:
+                st.session_state.sidebar_favorites_count = 0
+
+        favorites_count = st.session_state.sidebar_favorites_count
 
         # Navigation info with counts
         st.info(f"""
@@ -659,6 +678,12 @@ def main():
                     st.session_state.chat_active = True
                     st.session_state.current_query = text_query or "Image search"
 
+                    # Store original search context for refinements
+                    st.session_state.original_image_bytes = image_bytes
+                    st.session_state.original_text_query = text_query
+                    st.session_state.detected_labels = results.get("detected_labels", [])
+                    st.session_state.detected_objects = results.get("detected_objects", [])
+
                     # Generate contextual suggestions based on detected elements
                     contextual_suggestions = generate_contextual_suggestions(results)
 
@@ -710,6 +735,11 @@ def main():
                         st.session_state.chat_history = []
                         st.session_state.search_results = None
                         st.session_state.current_session_id = None
+                        # Clear search context for fresh start
+                        st.session_state.original_image_bytes = None
+                        st.session_state.original_text_query = None
+                        st.session_state.detected_labels = []
+                        st.session_state.detected_objects = []
                         st.rerun()
 
                 # Detected Elements
@@ -758,9 +788,12 @@ def main():
                             st.markdown("**💡 Try asking:**")
                             for suggestion in msg["suggestions"]:
                                 if st.button(f"→ {suggestion}", key=f"sug_{hash(suggestion)}_{msg['timestamp']}"):
-                                    # Trigger search with suggestion
-                                    with st.spinner("🔍 Searching..."):
+                                    # Trigger search with suggestion only (no re-upload)
+                                    with st.spinner("🔍 Refining search..."):
                                         start_time = time.time()
+
+                                        # Search with just the refinement text
+                                        # Context is maintained through chat history
                                         results, error = search_images(
                                             text_query=suggestion,
                                             user_type=user_type
@@ -825,8 +858,11 @@ def main():
                     st.rerun()
 
             if send_clicked and chat_input:
-                with st.spinner("🔍 Searching..."):
+                with st.spinner("🔍 Refining search..."):
                     start_time = time.time()
+
+                    # Search with just the refinement text
+                    # Context is maintained through chat history, no re-upload needed
                     results, error = search_images(
                         text_query=chat_input,
                         user_type=user_type
